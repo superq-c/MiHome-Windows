@@ -57,6 +57,13 @@ _UNSUPPORTED_PROP_CODES = {-704002000}
 # spec 并发拉取线程数；目标是 miot-spec.org 的独立请求，无会话竞争
 _SPEC_WORKERS = 8
 
+# 已核实的复合设备主开关。不能默认取规格里的第一个 on：两季扇依次是
+# 加热器(2)、风机(5)、指示灯(9)，卡片与快捷控制应读写风机开关。
+# 按完整规格 URN 限定，避免把同一品类或其他版本的服务编号一并假定相同。
+_POWER_METHOD_OVERRIDES = {
+    "urn:miot-spec-v2:device:fan:0000A005:dmaker-p23:1": (5, 1),
+}
+
 
 class ServiceError(Exception):
     """携带用户可直接阅读的中文信息，界面层直接展示 message 即可。"""
@@ -244,6 +251,66 @@ class MijiaService:
         return sorted(result, key=lambda x: (x.home_name, x.room_name, x.name))
 
     # ---------- 设备控制 ----------
+
+    @_serialized
+    def camera_relay_connection(self, did: str):
+        """通过现有已认证会话获取中继配置，不向桥接进程传递账号凭据。"""
+        from Crypto.PublicKey import ECC
+        from .camera_bridge import CameraError, RelayCameraConnection
+
+        try:
+            devices = self._api.get_devices_list() + self._api.get_shared_devices_list()
+            device = next((d for d in devices if str(d.get("did")) == did), None)
+            if device is None or ".camera." not in device.get("model", ""):
+                raise CameraError("未找到支持的摄像头")
+            if not device.get("isOnline"):
+                raise CameraError("摄像头已离线")
+            key = ECC.generate(curve="Curve25519")
+            public = key.public_key().export_key(format="raw").hex()
+            result = self._api._request("/v2/device/miss_get_vendor", {
+                "app_pubkey": public, "did": did, "support_vendors": "TUTK_CS2_MTP"})
+            vendor = result["vendor"]
+            if vendor["vendor"] != 4:
+                raise CameraError("此型号暂不支持远程中继预览")
+            params = vendor["vendor_params"]
+            values = {"vendor": "cs2", "p2p_id": params["p2p_id"],
+                      "relay_init": params["init_string"], "client_public": public,
+                      "client_private": key.seed.hex(), "device_public": result["public_key"],
+                      "sign": result["sign"]}
+            if not all(isinstance(v, str) and v for v in values.values()):
+                raise CameraError("摄像头未返回完整中继授权")
+            return RelayCameraConnection(model=device["model"], parameters=values)
+        except CameraError:
+            raise
+        except Exception:
+            raise CameraError("无法获取摄像头中继授权，请检查网络及登录状态") from None
+
+    @_serialized
+    def camera_connection(self, did: str):
+        """为本机视频桥接取连接信息；绝不把认证信息写入日志或设置。"""
+        import ipaddress
+        from .camera_bridge import CameraConnection, CameraError
+
+        try:
+            devices = self._api.get_devices_list() + self._api.get_shared_devices_list()
+        except Exception:
+            raise CameraError("无法获取摄像头连接信息，请检查网络和登录状态") from None
+        device = next((d for d in devices if str(d.get("did")) == did), None)
+        if device is None or ".camera." not in device.get("model", ""):
+            raise CameraError("未找到支持的摄像头")
+        if not device.get("isOnline"):
+            raise CameraError("摄像头已离线")
+        try:
+            address = ipaddress.ip_address(device.get("localip") or device.get("ip") or "")
+            if address.version != 4 or not address.is_private or address.is_loopback:
+                raise ValueError()
+        except ValueError:
+            raise CameraError("未获取到摄像头局域网地址，请确认电脑与摄像头在同一网络") from None
+        auth = self._api.auth_data
+        if not auth.get("userId") or not auth.get("passToken"):
+            raise CameraError("登录会话缺少视频授权信息，请重新扫码登录")
+        return CameraConnection(model=device["model"], did=did, ip=str(address),
+                                user_id=str(auth["userId"]), pass_token=auth["passToken"])
 
     @_serialized
     def device_detail(self, did: str) -> DeviceDetail:
@@ -536,6 +603,9 @@ class MijiaService:
         target_of: dict[str, str] = {}
         for did in dids:
             info = spec_map.get(did)
+            if info is None and self._device_index.get(did, ("", "", ""))[1]:
+                # 有规格标识但未取到规格：状态未知，不能误记为无开关能力。
+                continue
             method = self._find_on_method(info, did) if info else None
             if method is None:
                 # spec 缺失或无开关属性，直接记为无能力。
@@ -685,6 +755,9 @@ class MijiaService:
         等多路属性。**必须按 did 后缀选对应的那一路**：三个虚拟设备都
         取第一条的话，后两路永远在控制第一路（用户表现为"虚拟设备点不
         动/开关错灯"）。
+
+        普通设备优先使用已核实的主开关映射；复合设备的第一个 on
+        可能只控制加热器或指示灯，不能代表整机状态。
         """
         props = [
             prop for prop in info.get("properties", [])
@@ -703,6 +776,13 @@ class MijiaService:
             index = gang - 2
             if 0 <= index < len(props):
                 return props[index]["method"]
+        else:
+            preferred = _POWER_METHOD_OVERRIDES.get(info.get("spec_type"))
+            if preferred is not None:
+                # 已适配型号缺失主开关时不退回加热器等其他功能，避免误控制。
+                return next((prop["method"] for prop in props
+                             if (prop["method"].get("siid"),
+                                 prop["method"].get("piid")) == preferred), None)
         return props[0]["method"]
 
     # ---------- 环境读数（卡片副标题展示用） ----------
@@ -903,7 +983,9 @@ class MijiaService:
                     lambda st: self._fetch_spec(st, cache_dir), to_fetch
                 )
                 for spec_type, spec in zip(to_fetch, fetched):
-                    self._spec_cache[spec_type] = spec
+                    # 请求失败不做永久负缓存，下轮轮询仍可重新获取规格。
+                    if spec is not None:
+                        self._spec_cache[spec_type] = spec
             for did in dids:
                 if did not in result:
                     result[did] = self._spec_cache.get(

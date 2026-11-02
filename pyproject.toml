@@ -14,6 +14,8 @@ dependencies = [
     # 上游 5.x 起设备规格改从 miot-spec.org 官方源按 spec_type 获取，
     # 适配层已同步改造；仍锁大版本，升级前必须人工验证
     "mijiaAPI>=5,<6",
+    # 摄像头中继授权的 X25519 密钥交换；不依赖上游的传递依赖声明
+    "pycryptodome>=3.20",
     "PySide6>=6.7",
     # 登录对话框渲染二维码用；虽是 mijiaAPI 的传递依赖，仍显式声明防止被动移除
     "qrcode>=8",

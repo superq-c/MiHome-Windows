@@ -1,0 +1,55 @@
+diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -116,11 +116,19 @@
+ 		return nil, err
+ 	}
+ 
+-	select {
+-	case reply := <-c.replies:
+-		return reply, nil
+-	case <-time.After(wait):
+-		return nil, nil
++	timer := time.NewTimer(wait)
++	defer timer.Stop()
++	for {
++		select {
++		case reply := <-c.replies:
++			// Video/event responses must not satisfy a motor request.
++			if cmd == cmdMotorReq && !isMotorReply(reply) {
++				continue
++			}
++			return reply, nil
++		case <-timer.C:
++			return nil, nil
++		}
+ 	}
+ }
+ 
+@@ -146,6 +154,10 @@
+ 		delete(c.listeners, messages)
+ 		c.listenersMu.Unlock()
+ 	}
++}
++
++func isMotorReply(data []byte) bool {
++	return len(data) >= 4 && binary.BigEndian.Uint32(data[:4]) == cmdMotorRes
+ }
+ 
+ func (c *Client) readReplies() {
+@@ -157,7 +169,15 @@
+ 		if (cmd == cmdEncoded || bits.ReverseBytes32(cmd) == cmdEncoded) && len(data) > 8 {
+ 			if decoded, err := crypto.Decode(data, c.key); err == nil {
+ 				data = decoded
++			} else {
++				continue
+ 			}
++		} else {
++			// CS2 reads the command word little-endian; normalize to wire BE.
++			if cmd > 0xffff {
++				cmd = bits.ReverseBytes32(cmd)
++			}
++			data = append(binary.BigEndian.AppendUint32(nil, cmd), data...)
+ 		}
+ 		if Log != nil {
+ 			Log(cmd, data)

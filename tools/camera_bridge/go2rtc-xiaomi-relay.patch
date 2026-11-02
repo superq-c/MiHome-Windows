@@ -1,0 +1,16 @@
+diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -67,7 +67,11 @@ func NewClient(rawURL string) (*Client, error) {
+ 	var conn Conn
+ 	switch s := query.Get("vendor"); s {
+ 	case "cs2":
+-		conn, err = cs2.Dial(u.Host, query.Get("transport"))
++		if init := query.Get("relay_init"); init != "" {
++			conn, err = cs2.DialRelay(query.Get("p2p_id"), init)
++		} else {
++			conn, err = cs2.Dial(u.Host, query.Get("transport"))
++		}
+ 	case "tutk":
+ 		conn, err = tutk.Dial(u.Host, query.Get("uid"), "Miss", "client")
+ 	default:

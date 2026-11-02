@@ -1,0 +1,1057 @@
+diff --git a/internal/streams/stream.go b/internal/streams/stream.go
+index 984c73e..344a9ae 100644
+--- a/internal/streams/stream.go
++++ b/internal/streams/stream.go
+@@ -47,6 +47,22 @@ func NewStream(source any) *Stream {
+ 	}
+ }
+ 
++// Conns returns the connected producers, for modules that control the device (e.g. PTZ).
++func (s *Stream) Conns() []core.Producer {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	var conns []core.Producer
++	for _, prod := range s.producers {
++		prod.mu.Lock()
++		if prod.conn != nil {
++			conns = append(conns, prod.conn)
++		}
++		prod.mu.Unlock()
++	}
++	return conns
++}
++
+ func (s *Stream) Sources() []string {
+ 	sources := make([]string, 0, len(s.producers))
+ 	for _, prod := range s.producers {
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 1801fa8..9a5e7cd 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -5,10 +5,13 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
+ 	"strings"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+@@ -16,6 +19,8 @@ import (
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
+ 	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi/miss"
++	"github.com/AlexxIT/go2rtc/pkg/xiaomi/miss/cs2"
+ )
+ 
+ func Init() {
+@@ -46,7 +51,487 @@ func Init() {
+ 		return xiaomi.Dial(rawURL)
+ 	})
+ 
++	// Every message the camera sends on the command channel: replies to our commands, and possibly
++	// unsolicited events like motion alarms. Only in debug mode.
++	miss.Log = func(cmd uint32, data []byte) {
++		log.Debug().Msgf("xiaomi: camera message cmd=%#x len=%d text=%q hex=%s", cmd, len(data), printableText(data), shortHex(data))
++	}
++
++	// Data on the channels go2rtc does not use, and unknown message types
++	cs2.Log = func(format string, args ...any) {
++		log.Warn().Msgf("xiaomi: "+format, args...)
++	}
++
+ 	api.HandleFunc("api/xiaomi", apiXiaomi)
++	api.HandleFunc("api/xiaomi/command", apiCommand)
++	api.HandleFunc("api/xiaomi/miot", apiMiot)
++	api.HandleFunc("api/xiaomi/watch", apiWatch)
++	api.HandleFunc("api/xiaomi/motion", apiMotion)
++	api.HandleFunc("api/xiaomi/events", apiEvents)
++	api.HandleFunc("api/xiaomi/image", apiEventImage)
++	api.HandleFunc("api/xiaomi/speaker", apiSpeaker)
++}
++
++type miotParam struct {
++	Did   string          `json:"did"`
++	Siid  int             `json:"siid"`
++	Piid  int             `json:"piid"`
++	Value json.RawMessage `json:"value,omitempty"`
++}
++
++// apiMiot reads or writes MIoT properties of the camera behind a stream, through the Xiaomi cloud.
++// Only the device of the stream can be reached:
++// GET  /api/xiaomi/miot?src=camera1&props=2.1,3.1
++// POST /api/xiaomi/miot?src=camera1&siid=2&piid=1&value=false
++func apiMiot(w http.ResponseWriter, r *http.Request) {
++	query := r.URL.Query()
++	stream := streams.Get(query.Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	var u *url.URL
++	for _, source := range stream.Sources() {
++		if strings.HasPrefix(source, "xiaomi://") {
++			u, _ = url.Parse(source)
++			break
++		}
++	}
++	if u == nil || u.User == nil {
++		http.Error(w, "not a Xiaomi cloud stream", http.StatusBadRequest)
++		return
++	}
++	did := u.Query().Get("did")
++
++	var apiURL string
++	var params []miotParam
++
++	switch r.Method {
++	case "GET":
++		apiURL = "/miotspec/prop/get"
++		for _, prop := range strings.Split(query.Get("props"), ",") {
++			var siid, piid int
++			if _, err := fmt.Sscanf(prop, "%d.%d", &siid, &piid); err != nil {
++				http.Error(w, "wrong props", http.StatusBadRequest)
++				return
++			}
++			params = append(params, miotParam{Did: did, Siid: siid, Piid: piid})
++		}
++	case "POST":
++		apiURL = "/miotspec/prop/set"
++		siid, err1 := strconv.Atoi(query.Get("siid"))
++		piid, err2 := strconv.Atoi(query.Get("piid"))
++		value := json.RawMessage(query.Get("value"))
++		if err1 != nil || err2 != nil || !json.Valid(value) {
++			http.Error(w, "wrong siid, piid or value", http.StatusBadRequest)
++			return
++		}
++		params = []miotParam{{Did: did, Siid: siid, Piid: piid, Value: value}}
++	default:
++		http.Error(w, "", http.StatusMethodNotAllowed)
++		return
++	}
++
++	body, err := json.Marshal(map[string]any{"params": params})
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	res, err := cloudUserRequest(u.User, apiURL, string(body))
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	w.Header().Set("Content-Type", api.MimeJSON)
++	_, _ = w.Write(res)
++}
++
++// printableText keeps the readable part of a message (most are JSON), shortHex shows the raw start of it.
++func printableText(data []byte) string {
++	text := make([]rune, 0, len(data))
++	for _, b := range data {
++		if b >= 0x20 && b < 0x7f {
++			text = append(text, rune(b))
++		}
++	}
++	return string(text)
++}
++
++func shortHex(data []byte) string {
++	if len(data) > 48 {
++		return hex.EncodeToString(data[:48]) + "..."
++	}
++	return hex.EncodeToString(data)
++}
++
++// apiWatch opens a control-only connection to the camera (no video) and reports what it sends on its own:
++// GET /api/xiaomi/watch?src=camera1&seconds=120
++func apiWatch(w http.ResponseWriter, r *http.Request) {
++	query := r.URL.Query()
++	stream := streams.Get(query.Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	var u *url.URL
++	for _, source := range stream.Sources() {
++		if strings.HasPrefix(source, "xiaomi://") {
++			u, _ = url.Parse(source)
++			break
++		}
++	}
++	if u == nil || u.User == nil {
++		http.Error(w, "not a Xiaomi cloud stream", http.StatusBadRequest)
++		return
++	}
++
++	seconds, _ := strconv.Atoi(query.Get("seconds"))
++	if seconds <= 0 || seconds > 600 {
++		seconds = 120
++	}
++
++	rawURL, err := getCameraURL(u)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	client, err := miss.NewClient(rawURL)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	defer client.Close()
++
++	type message struct {
++		Time string `json:"time"`
++		Text string `json:"text"`
++		Hex  string `json:"hex"`
++	}
++	messages := make([]message, 0, 16)
++	deadline := time.After(time.Duration(seconds) * time.Second)
++
++	for {
++		select {
++		case data := <-client.Replies():
++			messages = append(messages, message{
++				Time: time.Now().Format("15:04:05"),
++				Text: printableText(data),
++				Hex:  shortHex(data),
++			})
++		case <-deadline:
++			api.ResponseJSON(w, map[string]any{"seconds": seconds, "count": len(messages), "messages": messages})
++			return
++		case <-r.Context().Done():
++			return
++		}
++	}
++}
++
++// cameraBaseURL is the Xiaomi host that keeps the camera events and clips.
++func cameraBaseURL(region string) string {
++	host := "business.smartcamera.api.io.mi.com"
++	if region != "" && region != "cn" {
++		host = region + "." + host
++	}
++	return "https://" + host
++}
++
++// apiEvents lists the events the camera uploaded to the Xiaomi cloud (read only), the same list the Mi Home app
++// shows: GET /api/xiaomi/events?src=camera1&minutes=60&limit=10
++func apiEvents(w http.ResponseWriter, r *http.Request) {
++	query := r.URL.Query()
++	stream := streams.Get(query.Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	u := xiaomiSource(stream)
++	if u == nil || u.User == nil {
++		http.Error(w, "not a Xiaomi cloud stream", http.StatusBadRequest)
++		return
++	}
++
++	minutes, _ := strconv.Atoi(query.Get("minutes"))
++	if minutes <= 0 {
++		minutes = 60
++	}
++	limit, _ := strconv.Atoi(query.Get("limit"))
++	if limit <= 0 {
++		limit = 10
++	}
++
++	cloud, err := getCloud(u.User.Username())
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	region, _ := u.User.Password()
++	source := u.Query()
++	end := time.Now().UnixMilli()
++	begin := end - int64(minutes)*60_000
++
++	params := fmt.Sprintf(
++		`{"did":"%s","model":"%s","doorBell":false,"eventType":"Default","needMerge":true,"sortType":"DESC","region":"%s","language":"en","beginTime":%d,"endTime":%d,"limit":%d}`,
++		source.Get("did"), source.Get("model"), strings.ToUpper(region), begin, end, limit,
++	)
++
++	res, err := cloud.RequestGet(cameraBaseURL(region), "/common/app/get/eventlist", params)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	w.Header().Set("Content-Type", api.MimeJSON)
++	_, _ = w.Write(res)
++}
++
++// processorBaseURL is the Xiaomi host that serves the event thumbnails.
++func processorBaseURL(region string) string {
++	host := "processor.smartcamera.api.io.mi.com"
++	if region != "" && region != "cn" {
++		host = region + "." + host
++	}
++	return "https://" + host
++}
++
++// apiEventImage returns, as a JPEG, the thumbnail the camera took with an event of the event list (its fileId and
++// imgStoreId): GET /api/xiaomi/image?src=camera1&fileId=123&stoId=CAMERA_IMG_...
++func apiEventImage(w http.ResponseWriter, r *http.Request) {
++	query := r.URL.Query()
++	stream := streams.Get(query.Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	u := xiaomiSource(stream)
++	if u == nil || u.User == nil {
++		http.Error(w, "not a Xiaomi cloud stream", http.StatusBadRequest)
++		return
++	}
++
++	fileID, storeID := query.Get("fileId"), query.Get("stoId")
++	if fileID == "" || storeID == "" {
++		http.Error(w, "fileId and stoId are required", http.StatusBadRequest)
++		return
++	}
++
++	cloud, err := getCloud(u.User.Username())
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	region, _ := u.User.Password()
++	image, err := cloud.RequestEventImage(processorBaseURL(region), u.Query().Get("did"), fileID, storeID)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadGateway)
++		return
++	}
++
++	w.Header().Set("Content-Type", "image/jpeg")
++	_, _ = w.Write(image)
++}
++
++type subscriber interface {
++	Subscribe() (<-chan []byte, func())
++}
++
++// xiaomiSource returns the xiaomi:// source of a stream.
++func xiaomiSource(stream *streams.Stream) *url.URL {
++	for _, source := range stream.Sources() {
++		if strings.HasPrefix(source, "xiaomi://") {
++			u, _ := url.Parse(source)
++			return u
++		}
++	}
++	return nil
++}
++
++// apiMotion streams what the camera says, as Server-Sent Events. A camera with motion tracking enabled sends
++// a motor message on its own when it turns to follow a movement:
++// GET /api/xiaomi/motion?src=camera1
++func apiMotion(w http.ResponseWriter, r *http.Request) {
++	stream := streams.Get(r.URL.Query().Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	// Reuse the connection of a playing stream, so the camera does not get a second session
++	var shared subscriber
++	for _, conn := range stream.Conns() {
++		if sub, ok := conn.(subscriber); ok {
++			shared = sub
++			break
++		}
++	}
++
++	var messages <-chan []byte
++	var unsubscribe func()
++
++	if shared != nil {
++		messages, unsubscribe = shared.Subscribe()
++	} else {
++		u := xiaomiSource(stream)
++		if u == nil || u.User == nil {
++			http.Error(w, "not a Xiaomi cloud stream", http.StatusBadRequest)
++			return
++		}
++		rawURL, err := getCameraURL(u)
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusInternalServerError)
++			return
++		}
++		client, err := miss.NewClient(rawURL)
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusInternalServerError)
++			return
++		}
++		defer client.Close()
++		messages, unsubscribe = client.Subscribe()
++	}
++	defer unsubscribe()
++
++	flusher, ok := w.(http.Flusher)
++	if !ok {
++		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
++		return
++	}
++
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-cache")
++	_, _ = fmt.Fprintf(w, "event: ready\ndata: {\"shared\":%t}\n\n", shared != nil)
++	flusher.Flush()
++
++	// A shared connection dies with its stream, and a kept alive one needs regular pings
++	check := time.NewTicker(15 * time.Second)
++	defer check.Stop()
++
++	for {
++		select {
++		case data := <-messages:
++			event, _ := json.Marshal(map[string]string{"text": printableText(data), "hex": shortHex(data)})
++			_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", event)
++			flusher.Flush()
++
++		case <-check.C:
++			if shared != nil && !stillConnected(stream, shared) {
++				return // the stream stopped: the client reconnects and gets its own connection
++			}
++			_, _ = fmt.Fprint(w, ": ping\n\n")
++			flusher.Flush()
++
++		case <-r.Context().Done():
++			return
++		}
++	}
++}
++
++func stillConnected(stream *streams.Stream, shared subscriber) bool {
++	for _, conn := range stream.Conns() {
++		if sub, ok := conn.(subscriber); ok && sub == shared {
++			return true
++		}
++	}
++	return false
++}
++
++type commandSender interface {
++	SendCommand(cmd uint32, payload []byte) ([]byte, error)
++}
++
++// apiCommand sends a raw MISS command to a playing Xiaomi stream, e.g. PTZ:
++// POST /api/xiaomi/command?src=camera1&cmd=0x112&data={"operation":1}
++func apiCommand(w http.ResponseWriter, r *http.Request) {
++	if r.Method != "POST" {
++		http.Error(w, "", http.StatusMethodNotAllowed)
++		return
++	}
++
++	query := r.URL.Query()
++	stream := streams.Get(query.Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	cmd, err := strconv.ParseUint(query.Get("cmd"), 0, 32)
++	if err != nil {
++		http.Error(w, "wrong cmd", http.StatusBadRequest)
++		return
++	}
++
++	for _, conn := range stream.Conns() {
++		sender, ok := conn.(commandSender)
++		if !ok {
++			continue
++		}
++
++		reply, err := sender.SendCommand(uint32(cmd), []byte(query.Get("data")))
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusInternalServerError)
++			return
++		}
++
++		api.ResponseJSON(w, map[string]string{
++			"reply": string(reply),
++			"hex":   hex.EncodeToString(reply),
++		})
++		return
++	}
++
++	http.Error(w, "no Xiaomi camera is playing on this stream", http.StatusConflict)
++}
++
++type speaker interface {
++	Speak(r io.Reader, format string, rate uint32) error
++}
++
++// apiSpeaker plays the request body on the speaker of the Xiaomi camera of a playing stream (two-way audio): raw
++// mono audio, sent as it is produced. format=pcma (A-law, default) or pcm (16-bit little endian), rate=8000 (default)
++// or 16000: POST /api/xiaomi/speaker?src=camera1&format=pcma&rate=8000
++func apiSpeaker(w http.ResponseWriter, r *http.Request) {
++	if r.Method != "POST" {
++		http.Error(w, "", http.StatusMethodNotAllowed)
++		return
++	}
++
++	query := r.URL.Query()
++	stream := streams.Get(query.Get("src"))
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++
++	var rate uint32
++	switch query.Get("rate") {
++	case "", "8000":
++		rate = 8000
++	case "16000":
++		rate = 16000
++	default:
++		http.Error(w, "rate must be 8000 or 16000", http.StatusBadRequest)
++		return
++	}
++
++	for _, conn := range stream.Conns() {
++		if s, ok := conn.(speaker); ok {
++			if err := s.Speak(r.Body, query.Get("format"), rate); err != nil {
++				http.Error(w, err.Error(), http.StatusInternalServerError)
++			}
++			return
++		}
++	}
++
++	http.Error(w, "no Xiaomi camera is playing on this stream", http.StatusConflict)
+ }
+ 
+ var tokens map[string]string
+diff --git a/main.go b/main.go
+index ca70e84..743a900 100644
+--- a/main.go
++++ b/main.go
+@@ -52,7 +52,7 @@ import (
+ 
+ func main() {
+ 	// version will be set later from -buildvcs info, this used only as fallback
+-	app.Version = "1.9.14"
++	app.Version = "1.9.14-xiaomi-control"
+ 
+ 	type module struct {
+ 		name string
+diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
+index 0dcfd24..8c61c7c 100644
+--- a/pkg/xiaomi/cloud.go
++++ b/pkg/xiaomi/cloud.go
+@@ -2,6 +2,8 @@ package xiaomi
+ 
+ import (
+ 	"bytes"
++	"crypto/aes"
++	"crypto/cipher"
+ 	"crypto/md5"
+ 	"crypto/rand"
+ 	"crypto/rc4"
+@@ -392,6 +394,146 @@ func (c *Cloud) UserToken() (string, string) {
+ 	return c.userID, c.passToken
+ }
+ 
++// RequestGet calls an API that expects an encrypted GET, like the camera APIs, and returns the decrypted
++// body as is (their answers use "data", not "result" like the miotspec ones).
++func (c *Cloud) RequestGet(baseURL, apiURL, params string) ([]byte, error) {
++	query, signedNonce, err := c.encryptQuery(apiURL, params)
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest("GET", baseURL+apiURL+"?"+query.Encode(), nil)
++	if err != nil {
++		return nil, err
++	}
++
++	req.Header.Set("Cookie", c.cookies)
++	req.Header.Set("MIOT-ENCRYPT-ALGORITHM", "ENCRYPT-RC4")
++	req.Header.Set("Accept-Encoding", "identity")
++
++	res, err := c.client.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer res.Body.Close()
++
++	if res.StatusCode != http.StatusOK {
++		return nil, errors.New(res.Status)
++	}
++
++	body, err := io.ReadAll(res.Body)
++	if err != nil {
++		return nil, err
++	}
++
++	ciphertext, err := base64.StdEncoding.DecodeString(string(body))
++	if err != nil {
++		return nil, fmt.Errorf("xiaomi: %s", body)
++	}
++
++	return crypt(signedNonce, ciphertext)
++}
++
++// encryptQuery signs and encrypts the parameters of a GET request to the camera APIs.
++func (c *Cloud) encryptQuery(apiURL, params string) (url.Values, []byte, error) {
++	query := url.Values{"data": {params}}
++
++	nonce := genNonce()
++	signedNonce := genSignedNonce(c.ssecurity, nonce)
++
++	query.Set("rc4_hash__", genSignature64("GET", apiURL, query, signedNonce))
++
++	for _, v := range query {
++		ciphertext, err := crypt(signedNonce, []byte(v[0]))
++		if err != nil {
++			return nil, nil, err
++		}
++		v[0] = base64.StdEncoding.EncodeToString(ciphertext)
++	}
++
++	query.Set("signature", genSignature64("GET", apiURL, query, signedNonce))
++	query.Set("_nonce", base64.StdEncoding.EncodeToString(nonce))
++	return query, signedNonce, nil
++}
++
++// RequestEventImage downloads the thumbnail the camera took with an event. The server answers the JPEG
++// encrypted with AES-128-CBC, keyed with ssecurity and the IV sent in the request (segmentIv).
++func (c *Cloud) RequestEventImage(baseURL, did, fileID, storeID string) ([]byte, error) {
++	iv := make([]byte, aes.BlockSize)
++	if _, err := rand.Read(iv); err != nil {
++		return nil, err
++	}
++
++	params, err := json.Marshal(map[string]string{
++		"did": did, "fileId": fileID, "stoId": storeID, "segmentIv": base64.StdEncoding.EncodeToString(iv),
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	const apiURL = "/miot/camera/app/v1/img"
++	query, _, err := c.encryptQuery(apiURL, string(params))
++	if err != nil {
++		return nil, err
++	}
++	query.Set("yetAnotherServiceToken", c.serviceToken())
++
++	req, err := http.NewRequest("GET", baseURL+apiURL+"?"+query.Encode(), nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Cookie", c.cookies)
++
++	res, err := c.client.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer res.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
++	if err != nil {
++		return nil, err
++	}
++	if res.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("xiaomi: %s %s", res.Status, shortBody(body))
++	}
++	// Errors come back as JSON, whose length is rarely a multiple of the block size
++	if len(body) == 0 || len(body)%aes.BlockSize != 0 {
++		return nil, fmt.Errorf("xiaomi: not an encrypted image: %s", shortBody(body))
++	}
++
++	block, err := aes.NewCipher(c.ssecurity)
++	if err != nil {
++		return nil, err
++	}
++	image := make([]byte, len(body))
++	cipher.NewCBCDecrypter(block, iv).CryptBlocks(image, body)
++
++	if pad := int(image[len(image)-1]); pad >= 1 && pad <= aes.BlockSize {
++		image = image[:len(image)-pad]
++	}
++	if !bytes.HasPrefix(image, []byte{0xFF, 0xD8}) {
++		return nil, errors.New("xiaomi: the decrypted thumbnail is not a JPEG image")
++	}
++	return image, nil
++}
++
++func (c *Cloud) serviceToken() string {
++	for _, part := range strings.Split(c.cookies, "; ") {
++		if token, ok := strings.CutPrefix(part, "serviceToken="); ok {
++			return token
++		}
++	}
++	return ""
++}
++
++func shortBody(body []byte) string {
++	if len(body) > 200 {
++		body = body[:200]
++	}
++	return strings.ToValidUTF8(string(body), "?")
++}
++
+ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]string) ([]byte, error) {
+ 	form := url.Values{"data": {params}}
+ 
+diff --git a/pkg/xiaomi/miss/backchannel.go b/pkg/xiaomi/miss/backchannel.go
+index 02ea3bb..bba1548 100644
+--- a/pkg/xiaomi/miss/backchannel.go
++++ b/pkg/xiaomi/miss/backchannel.go
+@@ -1,6 +1,9 @@
+ package miss
+ 
+ import (
++	"errors"
++	"fmt"
++	"io"
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+@@ -72,3 +75,75 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
+ 	p.Senders = append(p.Senders, sender)
+ 	return nil
+ }
++
++// The cameras expect 40 ms audio packets
++const speakerPacket = 40 * time.Millisecond
++
++// Speak plays raw audio read from r on the camera speaker, until r ends. Unlike AddTrack, the audio does not need to
++// come from a go2rtc stream: e.g. the body of an HTTP request.
++// format: "pcma" (A-law, 8 bits) or "pcm" (16-bit little endian); rate: 8000 or 16000. Without a format: A-law
++// 8 kHz, converted to PCM for the models that need it (like AddTrack).
++func (p *Producer) Speak(r io.Reader, format string, rate uint32) error {
++	model := p.client.SpeakerCodec()
++	if model == codecOPUS {
++		return errors.New("miss: this camera speaker needs Opus")
++	}
++	if rate == 0 {
++		rate = 8000
++	}
++
++	codec := uint32(codecPCMA)
++	bytesPerSample := 1
++	var transcode func([]byte) []byte
++
++	switch format {
++	case "":
++		if model == codecPCM {
++			codec = codecPCM
++			transcode = pcm.Transcode(&core.Codec{Name: core.CodecPCML, ClockRate: rate}, &core.Codec{Name: core.CodecPCMA, ClockRate: rate})
++		}
++	case "pcma":
++	case "pcm":
++		codec = codecPCM
++		bytesPerSample = 2
++	default:
++		return fmt.Errorf("miss: unknown speaker format %q", format)
++	}
++
++	if err := p.client.StartSpeaker(); err != nil {
++		return err
++	}
++	defer p.client.StopSpeaker()
++	// Same delay as AddTrack: the speaker is not ready right after the command
++	time.Sleep(time.Second)
++
++	buf := make([]byte, int(rate)*bytesPerSample*int(speakerPacket/time.Millisecond)/1000)
++	var start time.Time
++
++	for n := 0; ; n++ {
++		if _, err := io.ReadFull(r, buf); err != nil {
++			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++				return nil
++			}
++			return err
++		}
++
++		// The speaker plays packets as they come: audio received in bursts is paced at 40 ms per packet. After a
++		// pause (microphone off), the pace starts again from now instead of sending the backlog at once.
++		due := start.Add(time.Duration(n) * speakerPacket)
++		if wait := time.Until(due); n == 0 || wait < -200*time.Millisecond {
++			start = time.Now().Add(-time.Duration(n) * speakerPacket)
++		} else if wait > 0 {
++			time.Sleep(wait)
++		}
++
++		data := buf
++		if transcode != nil {
++			data = transcode(buf)
++		}
++		p.Send += len(data)
++		if err := p.client.WriteAudio(codec, data); err != nil {
++			return err
++		}
++	}
++}
+diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
+index 6eaa06c..6c4b347 100644
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -6,8 +6,10 @@ import (
+ 	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"math/bits"
+ 	"net"
+ 	"net/url"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/tutk"
+@@ -72,13 +74,105 @@ func NewClient(rawURL string) (*Client, error) {
+ 		return nil, err
+ 	}
+ 
+-	return &Client{Conn: conn, key: key, model: model}, nil
++	client := &Client{Conn: conn, key: key, model: model, replies: make(chan []byte, 10)}
++	go client.readReplies()
++	return client, nil
+ }
+ 
++// Log receives every message the camera sends on the command channel (set by internal/xiaomi).
++// Most are replies to our own commands; unsolicited ones may carry events like motion alarms.
++var Log func(cmd uint32, data []byte)
++
+ type Client struct {
+ 	Conn
+ 	key   []byte
+ 	model string
++
++	replies     chan []byte
++	sendMu      sync.Mutex
++	listeners   map[chan []byte]struct{}
++	listenersMu sync.Mutex
++}
++
++// SendCommand sends a MISS command (like cmdMotorReq) and waits a moment for the camera reply.
++// Replies must always be read: the command channel has a small buffer and the connection
++// is closed when it is full.
++func (c *Client) SendCommand(cmd uint32, payload []byte, wait time.Duration) ([]byte, error) {
++	c.sendMu.Lock()
++	defer c.sendMu.Unlock()
++
++	// Drop replies to previous commands that arrived after their timeout
++	for len(c.replies) > 0 {
++		<-c.replies
++	}
++
++	data := binary.BigEndian.AppendUint32(nil, cmd)
++	data = append(data, payload...)
++	if err := c.WriteCommand(data); err != nil {
++		return nil, err
++	}
++
++	select {
++	case reply := <-c.replies:
++		return reply, nil
++	case <-time.After(wait):
++		return nil, nil
++	}
++}
++
++// Replies exposes the messages read from the command channel.
++func (c *Client) Replies() <-chan []byte {
++	return c.replies
++}
++
++// Subscribe follows every message the camera sends, for as long as the returned function is not called.
++// The camera sends a motor message on its own when it turns to follow a movement.
++func (c *Client) Subscribe() (<-chan []byte, func()) {
++	messages := make(chan []byte, 10)
++
++	c.listenersMu.Lock()
++	if c.listeners == nil {
++		c.listeners = map[chan []byte]struct{}{}
++	}
++	c.listeners[messages] = struct{}{}
++	c.listenersMu.Unlock()
++
++	return messages, func() {
++		c.listenersMu.Lock()
++		delete(c.listeners, messages)
++		c.listenersMu.Unlock()
++	}
++}
++
++func (c *Client) readReplies() {
++	for {
++		cmd, data, err := c.Conn.ReadCommand()
++		if err != nil {
++			return
++		}
++		if (cmd == cmdEncoded || bits.ReverseBytes32(cmd) == cmdEncoded) && len(data) > 8 {
++			if decoded, err := crypto.Decode(data, c.key); err == nil {
++				data = decoded
++			}
++		}
++		if Log != nil {
++			Log(cmd, data)
++		}
++
++		c.listenersMu.Lock()
++		for messages := range c.listeners {
++			select {
++			case messages <- data:
++			default:
++			}
++		}
++		c.listenersMu.Unlock()
++
++		select {
++		case c.replies <- data:
++		default:
++		}
++	}
+ }
+ 
+ const (
+@@ -204,6 +298,11 @@ func (c *Client) StartSpeaker() error {
+ 	return c.WriteCommand(data)
+ }
+ 
++func (c *Client) StopSpeaker() error {
++	data := binary.BigEndian.AppendUint32(nil, cmdSpeakerStop)
++	return c.WriteCommand(data)
++}
++
+ // SpeakerCodec if the camera model has a non-standard two-way codec.
+ func (c *Client) SpeakerCodec() uint32 {
+ 	switch c.model {
+diff --git a/pkg/xiaomi/miss/cs2/conn.go b/pkg/xiaomi/miss/cs2/conn.go
+index 1bea07c..6eb5d3f 100644
+--- a/pkg/xiaomi/miss/cs2/conn.go
++++ b/pkg/xiaomi/miss/cs2/conn.go
+@@ -105,6 +105,15 @@ func handshake(host, transport string) (net.Conn, error) {
+ 	return conn, nil
+ }
+ 
++// Log reports data the camera sends on channels go2rtc does not use, and unknown message types.
++var Log func(format string, args ...any)
++
++func logf(format string, args ...any) {
++	if Log != nil {
++		Log(format, args...)
++	}
++}
++
+ func (c *Conn) worker() {
+ 	defer func() {
+ 		c.channels[0].Close()
+@@ -130,6 +139,10 @@ func (c *Conn) worker() {
+ 		switch buf[1] {
+ 		case msgDrw:
+ 			ch := buf[5]
++			if int(ch) >= len(c.channels) || c.channels[ch] == nil {
++				logf("cs2: data on unused channel %d: %x", ch, buf[:n])
++				continue
++			}
+ 			channel := c.channels[ch]
+ 
+ 			if c.isTCP {
+@@ -264,7 +277,7 @@ func (c *Conn) WritePacket(hdr, payload []byte) error {
+ 	c.seqCh3++
+ 	binary.BigEndian.PutUint32(req[8:], n)
+ 	copy(req[offset:], hdr)
+-	copy(req[offset+hdrSize:], hdr)
++	copy(req[offset+hdrSize:], payload)
+ 
+ 	_, err := c.Conn.Write(req)
+ 	return err
+diff --git a/pkg/xiaomi/miss/producer.go b/pkg/xiaomi/miss/producer.go
+index eeaa496..ceae044 100644
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -56,6 +56,7 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
+ 
+ 	var vcodec, acodec *core.Codec
++	var firstPCMA *Packet
+ 
+ 	for {
+ 		pkt, err := client.ReadPacket()
+@@ -84,8 +85,14 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 				}
+ 			}
+ 		case codecPCMA:
++			// Some cameras (e.g. chuangmi.camera.026c02) send 16 kHz A-law, so the rate is measured
++			// from two consecutive packets instead of assuming 8 kHz
+ 			if acodec == nil {
+-				acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
++				if firstPCMA == nil {
++					firstPCMA = pkt
++				} else if pkt.Timestamp > firstPCMA.Timestamp {
++					acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: pcmaClockRate(firstPCMA, pkt)}
++				}
+ 			}
+ 		case codecOPUS:
+ 			if acodec == nil {
+@@ -115,16 +122,31 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 			Codecs:    []*core.Codec{acodec},
+ 		})
+ 
++		// The two-way audio keeps its previous format (8 kHz for A-law)
++		backchannel := acodec.Clone()
++		if backchannel.Name == core.CodecPCMA {
++			backchannel.ClockRate = 8000
++		}
++
+ 		medias = append(medias, &core.Media{
+ 			Kind:      core.KindAudio,
+ 			Direction: core.DirectionSendonly,
+-			Codecs:    []*core.Codec{acodec.Clone()},
++			Codecs:    []*core.Codec{backchannel},
+ 		})
+ 	}
+ 
+ 	return medias, nil
+ }
+ 
++// pcmaClockRate guesses the A-law sample rate (1 byte per sample) from the duration of the first packet
++func pcmaClockRate(first, next *Packet) uint32 {
++	rate := uint64(len(first.Payload)) * 1000 / (next.Timestamp - first.Timestamp)
++	if rate > 12000 {
++		return 16000
++	}
++	return 8000
++}
++
+ const timestamp40ms = 48000 * 0.040
+ 
+ func (p *Producer) Start() error {
+@@ -193,6 +215,16 @@ func (p *Producer) Start() error {
+ 	}
+ }
+ 
++// Subscribe follows the messages of the camera of a playing stream.
++func (p *Producer) Subscribe() (<-chan []byte, func()) {
++	return p.client.Subscribe()
++}
++
++// SendCommand sends a raw MISS command to the camera while the stream is playing (e.g. PTZ).
++func (p *Producer) SendCommand(cmd uint32, payload []byte) ([]byte, error) {
++	return p.client.SendCommand(cmd, payload, 2*time.Second)
++}
++
+ func (p *Producer) Stop() error {
+ 	_ = p.client.StopMedia()
+ 	return p.Connection.Stop()

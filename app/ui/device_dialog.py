@@ -36,6 +36,10 @@ class DeviceDetailDialog(OverlayDialog):
         self._workbench = WorkbenchPanel(service, jobs, self._panel)
         outer.addWidget(self._workbench, stretch=1)
 
+    def done(self, result):
+        self._workbench.dispose_camera()
+        super().done(result)
+
     @property
     def panel(self) -> WorkbenchPanel:
         return self._workbench

@@ -1,0 +1,4 @@
+# Preserve checksummed bridge sources byte-for-byte for reproducible builds.
+# Patch context contains significant leading spaces/tabs; retain upstream CRLF/hash.
+tools/camera_bridge/*.patch -text -whitespace
+tools/camera_bridge/*.go -text

@@ -281,6 +281,7 @@ $NuitkaArgs = @(
     "run.py"
     "--standalone"
     "--enable-plugin=pyside6"
+    "--include-qt-plugins=multimedia"
     "--windows-console-mode=disable"
     "--windows-icon-from-ico=app\ui\icon.ico"
     "--include-package=app.siui"
@@ -308,6 +309,13 @@ $NuitkaArgs = @(
     "--file-version=$AppVersion"
     "--copyright=Copyright (C) 2026 MiHome-Windows contributors"
 )
+
+# 视频组件是可选的独立进程；只打包已构建的二进制与许可证，不带会话配置。
+if (Test-Path (Join-Path $Root 'runtime\camera\go2rtc.exe')) {
+    $NuitkaArgs += '--include-data-dir=runtime/camera=runtime/camera'
+} else {
+    Write-Host 'Camera runtime not built; live preview will be unavailable. Run tools\build_camera_bridge.ps1 to include it.' -ForegroundColor Yellow
+}
 
 # 强制用 MSVC（与上游作者一致）。不加这条时，Nuitka 一旦发现 MSVC/SDK
 # 不可用会自行回退到自带的备用工具链（还会联网下载），既慢又掩盖真正的

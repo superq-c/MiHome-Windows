@@ -41,6 +41,7 @@ _DEFAULTS: dict = {
     "room_order": [],
     # 启动后默认打开的标签名；空串表示「全屋」
     "default_tab": "",
+    "last_home": "",  # 左上角上次选择的家庭分组；无记录时选择首个分组
     # did -> 卡片副标题要显示的属性名列表（最多两个）。键不存在表示用
     # 默认温湿度；值恰好是空列表表示用户明确选择不外显，两者语义不同
     "metrics_selection": {},
@@ -161,6 +162,18 @@ def get_default_tab() -> str:
 def set_default_tab(name: str) -> None:
     raw = _read_raw()
     raw["default_tab"] = str(name or "")
+    _write_raw(raw)
+
+
+def get_last_home() -> str:
+    """读取上次实际家庭分组；旧的“全部”汇总项不参与恢复。"""
+    value = _read_raw().get("last_home")
+    return value if isinstance(value, str) and value != "全部" else ""
+
+
+def set_last_home(name: str) -> None:
+    raw = _read_raw()
+    raw["last_home"] = name if isinstance(name, str) and name != "全部" else ""
     _write_raw(raw)
 
 

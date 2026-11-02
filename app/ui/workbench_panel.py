@@ -95,6 +95,7 @@ class WorkbenchPanel(QWidget):
         # 列表里的设备对象引用：主窗口改名后会原地更新它的 name 与
         # cloud_name，面板读这个对象才能拿到最新值，而不是打开时的快照
         self._device: DeviceInfo | None = None
+        self._camera_preview = None
         self._detail: DeviceDetail | None = None
         self._sections: dict[str, QWidget] = {}
         self._module_defs: list[tuple[str, str, str]] = []
@@ -297,6 +298,11 @@ class WorkbenchPanel(QWidget):
         self._current_name = name
         self._current_room = room
         self._device = device
+        if device is not None:
+            from app.core.camera_bridge import is_camera
+            if is_camera(device):
+                from app.ui.camera_preview_card import CameraPreviewCard
+                self._camera_preview = CameraPreviewCard(self._service, device, self._container)
         self._title_label.setText(name)
         self._model_label.setText(room)
         self._title_label.hide()
@@ -607,7 +613,7 @@ class WorkbenchPanel(QWidget):
 
     def _render_workbench(self) -> None:
         self._clear_grid()
-        if not self._active_keys:
+        if not self._active_keys and self._camera_preview is None:
             # 属性与动作皆空的设备（如部分 BLE 类产品）没有可控制的
             # 功能，给出明确提示并隐藏“添加功能”入口
             no_funcs = bool(self._detail) and not self._detail.props and not self._detail.actions
@@ -627,6 +633,9 @@ class WorkbenchPanel(QWidget):
         self._footer_add_btn.setVisible(self._mode == "manage")
         self._left_h = 0
         self._right_h = 0
+        if self._camera_preview is not None:
+            self._left_col.addWidget(self._camera_preview)
+            self._left_h = self._camera_preview.height() + 14
         for key in list(self._active_keys):
             builder = self._module_builders.get(key)
             if builder is None:
@@ -654,6 +663,12 @@ class WorkbenchPanel(QWidget):
         self._reload_readings()
 
     def _clear_workbench(self) -> None:
+        self.dispose_camera()
+        if self._camera_preview is not None:
+            self._left_col.removeWidget(self._camera_preview)
+            self._right_col.removeWidget(self._camera_preview)
+            self._camera_preview.deleteLater()
+            self._camera_preview = None
         self._clear_grid()
         self._empty.hide()
         self._footer_add_btn.hide()
@@ -662,6 +677,10 @@ class WorkbenchPanel(QWidget):
         self._metrics_btn.hide()
         self._rename_btn.hide()
         self._custom_badge.hide()
+
+    def dispose_camera(self):
+        if self._camera_preview is not None:
+            self._camera_preview.dispose()
 
     def _clear_grid(self) -> None:
         # 重排动画进行中切换设备时，先停掉动画：动画目标 wrapper 随即
@@ -683,7 +702,8 @@ class WorkbenchPanel(QWidget):
             while lay.count():
                 item = lay.takeAt(0)
                 if w := item.widget():
-                    w.deleteLater()
+                    if w is not self._camera_preview:
+                        w.deleteLater()
                 elif item.layout():
                     # 跳过 stretch
                     pass
@@ -778,6 +798,8 @@ class WorkbenchPanel(QWidget):
     def retheme(self) -> None:
         """主题切换：刷新头部按钮与已加载的功能区块（内联样式冻结）。"""
         self._apply_header_button_styles()
+        if self._camera_preview is not None:
+            self._camera_preview.retheme()
         for btn in (self._refresh_btn, self._metrics_btn, self._edit_btn):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
@@ -808,10 +830,13 @@ class WorkbenchPanel(QWidget):
             while lay.count():
                 it = lay.takeAt(0)
                 w = it.widget()
-                if w is not None:
+                if w is not None and w is not self._camera_preview:
                     w.hide()
         # 2. 按新顺序以瀑布流重新加入（高度公式与 _render_workbench 一致）
         left_h = right_h = 0
+        if self._camera_preview is not None:
+            self._left_col.addWidget(self._camera_preview)
+            left_h = self._camera_preview.height() + 14
         for key in list(self._active_keys):
             w = self._wrappers.get(key)
             if w is None:
@@ -925,10 +950,28 @@ class WorkbenchPanel(QWidget):
         self._cooldown[name] = now + 3.0
         self._last_written[name] = value
         self._last_written_time[name] = now
+        power_name = next((p.name for p in self._detail.props
+                           if p.type == "bool" and p.writable
+                           and (p.name == "on" or p.name.startswith("on-")
+                                or p.name.startswith("on_"))), None) if self._detail else None
+        if self._camera_preview is not None and value is False and name == power_name:
+            # 点击关闭时立即停止本机预览，写入成功后再读取设备真实状态。
+            self._camera_preview.begin_power_off()
+
+        def written(_):
+            if self._camera_preview is not None and did == self._current_did:
+                self._camera_preview.power_write_finished()
+            QTimer.singleShot(3000, lambda: self._read_single(prop, name))
+
+        def failed(error):
+            if self._camera_preview is not None and did == self._current_did:
+                self._camera_preview.power_write_finished()
+            self._show_error(error)
+
         self._jobs.submit(
             lambda: self._service.write_prop(did, name, value),
-            on_success=lambda _: QTimer.singleShot(3000, lambda: self._read_single(prop, name)),
-            on_error=self._show_error,
+            on_success=written,
+            on_error=failed,
         )
 
     def _read_single(self, prop, name: str) -> None:
@@ -945,6 +988,8 @@ class WorkbenchPanel(QWidget):
         )
 
     def _reload_readings(self, force: bool = False) -> None:
+        if self._camera_preview is not None and force:
+            self._camera_preview.refresh_power()
         did = self._current_did
         if did is None:
             return
@@ -1047,6 +1092,14 @@ class WorkbenchPanel(QWidget):
         # 这里补上标题与改名入口，避免用户无从下手
         self._apply_display_name()
         self._rename_btn.show()
+        if self._camera_preview is not None:
+            self._loading.hide()
+            if self._left_col.indexOf(self._camera_preview) < 0:
+                self._left_col.addWidget(self._camera_preview)
+                self._left_col.addStretch(1)
+                self._right_col.addStretch(1)
+            self._body.show()
+            return
         self._load_hint.setText(f"加载失败：{error}")
         self._load_hint.setStyleSheet(
             f"color: {SiColors.ERROR_TEXT}; font-size: 9pt; background: transparent;")

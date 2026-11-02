@@ -213,14 +213,14 @@ class MainWindow(QMainWindow):
         # 用来丢弃"操作之前发出、操作之后才回来"的轮询结果
         self._power_gen: dict[str, int] = {}
         self._homes: list[str] = []
-        self._current_home: str = ""
+        self._current_home: str = settings_store.get_last_home()
         self._current_room = _ALL_ROOMS
         # 是否已经按设置里的默认标签初始化过房间选择
         self._room_initialized = False
         self._settings_dialog: SettingsDialog | None = None
         # did -> 开关状态记忆；None 表示确认无开关能力。
-        # 探测结论是设备的固有属性，跨家庭/房间/刷新复用；
-        # 串行队列 FIFO 保证探测与开关写入的回调顺序不会互相覆盖
+        # 切换家庭/房间时复用；启动与手动刷新会重新确认无能力结论。
+        # 操作版本号保证旧轮询不会覆盖本地开关操作。
         self._known_power: dict[str, bool | None] = {}
         # did -> 环境读数文案（温湿度），随轮询更新、随网格重建回填
         self._metrics: dict[str, str | None] = {}
@@ -236,6 +236,7 @@ class MainWindow(QMainWindow):
         self._update_check_done = False
         # 轮询防重入：上一轮批量读取未返回时跳过本轮定时触发
         self._poll_in_flight = False
+        self._power_refresh_pending = False
         # 网格重排防抖：拖动窗口会触发密集 resizeEvent，全部重建
         # 卡片代价太高，等布局稳定且列数变化时才重建
         self._grid_columns = 0
@@ -802,14 +803,15 @@ class MainWindow(QMainWindow):
             self.load_devices()
             return
         devices, known_power, metrics = cached
-        self._known_power.update(known_power)
+        # 旧缓存中的 None 可能来自一次规格请求失败，启动时重新确认能力。
+        self._known_power.update({d: s for d, s in known_power.items() if s is not None})
         self._metrics.update(metrics)
-        self._show_status("已从本地缓存加载，点击右上角菜单刷新可同步最新设备")
+        self._show_status("已从本地缓存加载，正在同步最新设备状态…")
         self._apply_devices(devices)
         self._apply_board_enabled()
-        # 缓存命中不会走 _on_devices_loaded，耗材要单独拉一次，
-        # 否则启动后要手动刷新才出现
-        self._refresh_consumables()
+        # 缓存只用于首屏加速；同步在线状态，避免旧的离线标记阻断开关轮询。
+        # 耗材由在线加载完成后的 _on_devices_loaded 统一拉取。
+        self.load_devices()
 
     def _apply_board_enabled(self) -> None:
         """按设置里的「桌面挂件」开关显示/隐藏挂件，并同步各菜单入口。
@@ -997,6 +999,8 @@ class MainWindow(QMainWindow):
         self._refresh_btn.setToolTip("刷新设备")
         # 对比要在替换前做：added/removed 以旧列表为基准
         added, removed = self._diff_devices(devices)
+        # 手动刷新也重新确认无开关能力的结论，修复历史失败缓存。
+        self._known_power = {d: s for d, s in self._known_power.items() if s is not None}
         self._apply_devices(devices)
         device_cache.save(devices, self._known_power, self._metrics)
         self._apply_board_enabled()
@@ -1013,12 +1017,17 @@ class MainWindow(QMainWindow):
         self._all_devices = devices
         self._apply_custom_names()
         homes = sorted(
-            {d.home_name for d in devices},
+            {d.home_name for d in devices if d.home_name and d.home_name != _ALL_HOMES},
             key=lambda h: (h == "未知", h),
         )
-        self._homes = [_ALL_HOMES] + homes
-        if self._current_home not in self._homes:
-            self._current_home = self._homes[0] if self._homes else _ALL_HOMES
+        self._homes = homes
+        last_home = settings_store.get_last_home()
+        if last_home in homes:
+            self._current_home = last_home
+        elif self._current_home not in homes:
+            self._current_home = homes[0] if homes else ""
+        if not last_home and self._current_home:
+            settings_store.set_last_home(self._current_home)
         # 默认标签只在首次加载时应用：之后刷新设备要保持用户当前看的
         # 房间，否则点一次刷新就被拽回默认页；房间消失时退回全屋
         if not self._room_initialized:
@@ -1026,11 +1035,12 @@ class MainWindow(QMainWindow):
             self._room_initialized = True
         elif self._current_room not in self._natural_tabs():
             self._current_room = _ALL_ROOMS
-        self._home_btn.setText(f"{self._current_home} ▾")
+        self._home_btn.setText(f"{self._current_home} ▾" if homes else "暂无分组")
+        self._home_btn.setEnabled(bool(homes))
         self._rebuild_tabs()
         self._rebuild_grid()
         self._update_count_label()
-        self._refresh_power_states(force=False)
+        self._refresh_power_states(force=True)
         self._refresh_metrics()
         self._update_voice_fab()
         self._update_tray_devices()
@@ -1692,9 +1702,13 @@ class MainWindow(QMainWindow):
         """批量拉取需要关注的设备开关状态。
 
         force=False 只探测还没有结论的设备（首次/新设备）；
-        force=True 忽略记忆全量重读（定时轮询）。
+        force=True 重读已知开关与尚未成功探测的设备（定时轮询）。
         离线设备的云端返回值是最后一次在线时的缓存，不可信，跳过。
         """
+        if self._poll_in_flight:
+            # 房间切换或手动刷新发生在读取途中：合并成完成后的一次重读。
+            self._power_refresh_pending = True
+            return
         # 以 DeviceInfo.online 为准：离线设备的云端开关值不可信
         dids = self._poll_dids()
         if not dids:
@@ -1704,8 +1718,9 @@ class MainWindow(QMainWindow):
             if not dids:
                 return
         else:
-            # 轮询仅针对已确认有开关能力的设备，避免无开关设备无效请求
-            dids = [d for d in dids if self._known_power.get(d) is not None]
+            # 未知状态需要重试；只有确认没有开关能力的 None 才跳过。
+            dids = [d for d in dids
+                    if d not in self._known_power or self._known_power[d] is not None]
             if not dids:
                 return
         self._poll_in_flight = True
@@ -1722,6 +1737,12 @@ class MainWindow(QMainWindow):
         # 轮询失败不打断界面，但必须留痕：持续失败意味着网络/凭据异常
         self._poll_in_flight = False
         logger.warning("轮询设备开关状态失败: %s", error)
+        self._run_pending_power_refresh()
+
+    def _run_pending_power_refresh(self) -> None:
+        if self._power_refresh_pending:
+            self._power_refresh_pending = False
+            self._refresh_power_states(force=True)
 
     def _bump_power_gen(self, did: str) -> None:
         """标记这台设备的开关状态被"本地操作"改过。
@@ -1763,6 +1784,7 @@ class MainWindow(QMainWindow):
                     {d: s for d, s in states.items() if d not in stale})
             except Exception:
                 logger.warning("同步挂件开关状态失败", exc_info=True)
+        self._run_pending_power_refresh()
 
     def _apply_power_state(self, did: str, state: bool | None) -> None:
         # 离线设备的开关值不落记忆：云端返回的是最后一次在线时的缓存。
@@ -1964,6 +1986,9 @@ class MainWindow(QMainWindow):
         menu.deleteLater()
 
     def _select_home(self, home: str) -> None:
+        if home not in self._homes:
+            return
+        settings_store.set_last_home(home)
         if home == self._current_home:
             return
         self._current_home = home
