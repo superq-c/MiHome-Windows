@@ -1,0 +1,146 @@
+name: 手动打包 Windows
+run-name: Windows package · ${{ github.ref_name }} · ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 同时创建 Release 草稿（不直接公开发布）
+        type: boolean
+        required: true
+        default: false
+      release_tag:
+        description: 草稿的新标签，须与代码版本一致，例如 v0.5.0 或 v0.5.0-rc.1
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    outputs:
+      artifact: ${{ steps.metadata.outputs.artifact }}
+      version: ${{ steps.metadata.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 检出选定代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: 安装 Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.24.0'
+          cache: false # 摄像头桥接有独立的固定源码与模块缓存路径
+      - name: 检查版本与输入
+        id: metadata
+        env:
+          CREATE_RELEASE: ${{ inputs.create_release }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $version = python -c "import app,tomllib; p=tomllib.load(open('pyproject.toml','rb')); v=p['project']['version']; assert v == app.__version__, 'Version mismatch'; print(v)"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read a consistent application version.' }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Expected a numeric major.minor.patch version.' }
+          if ($env:CREATE_RELEASE -eq 'true') {
+            $pattern = '^v' + [regex]::Escape($version) + '(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+            if ($env:RELEASE_TAG -notmatch $pattern) {
+              throw "Release tag must be v$version or v$version-<suffix>. Update both version files first."
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "artifact=MiHome-Windows-$version-windows-x64-$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+      - name: 安装应用与编译依赖
+        run: |
+          python -m venv .venv
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create the build environment.' }
+          .venv/Scripts/python.exe -m pip install -e . nuitka ordered-set zstandard
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+      - name: 运行离线回归
+        run: |
+          New-Item -ItemType Directory -Force .tmp/test-temp | Out-Null
+          $env:TEMP = (Resolve-Path .tmp/test-temp).Path
+          $env:TMP = $env:TEMP
+          # theme_test 有已记录的 Qt 离屏原生崩溃，不作为打包门禁。
+          foreach ($module in @('smoke_test', 'refresh_test', 'fan_test', 'camera_test', 'camera_card_test', 'home_selection_test')) {
+            .venv/Scripts/python.exe -m "tests.$module"
+            if ($LASTEXITCODE -ne 0) { throw "Regression failed: $module" }
+          }
+          ./tests/package_release_test.ps1
+      - name: 构建摄像头视频组件
+        run: ./tools/build_camera_bridge.ps1
+      - name: 编译 Windows 应用
+        run: ./build.ps1
+      - name: 检查并压缩发布目录
+        env:
+          APP_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          ./tools/package_release.ps1 -Version $env:APP_VERSION -Commit $env:GITHUB_SHA -OutputDirectory release-artifacts
+          "## Windows 打包完成" >> $env:GITHUB_STEP_SUMMARY
+          "版本：$env:APP_VERSION；提交：$env:GITHUB_SHA" >> $env:GITHUB_STEP_SUMMARY
+          "在本次运行底部的 Artifacts 下载完整包，解压全部内容后运行 MiHome-Windows.exe。" >> $env:GITHUB_STEP_SUMMARY
+      - name: 保存安装包与校验信息
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.metadata.outputs.artifact }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0 # 安装包已经是 ZIP，无需二次压缩
+
+  release:
+    if: ${{ inputs.create_release }}
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_COMMIT: ${{ github.sha }}
+      ARTIFACT_NAME: ${{ needs.build.outputs.artifact }}
+    steps:
+      - name: 下载已验证的安装包并创建草稿
+        shell: pwsh
+        run: |
+          # 不覆盖已有标签或 Release；API 故障也必须中止，不能当作“不存在”。
+          $headers = @{Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'}
+          $base = "$env:GITHUB_API_URL/repos/$env:GH_REPO"
+          foreach ($route in @("git/ref/tags/$env:RELEASE_TAG", "releases/tags/$env:RELEASE_TAG")) {
+            $exists = $false
+            try {
+              Invoke-RestMethod -Uri "$base/$route" -Headers $headers | Out-Null
+              $exists = $true
+            } catch {
+              if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+            }
+            if ($exists) { throw 'Tag or release already exists. Choose a new version/tag.' }
+          }
+          gh run download $env:GITHUB_RUN_ID --name $env:ARTIFACT_NAME --dir package
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download the build artifact.' }
+          $assets = @(Get-ChildItem package -File | ForEach-Object FullName)
+          @(
+            "Windows x64 build from commit $env:RELEASE_COMMIT.",
+            '',
+            'Extract the complete ZIP and run MiHome-Windows.exe. Keep its DLLs and runtime directory together.',
+            'Includes the camera preview runtime. SHA256SUMS.txt and BUILD-INFO.json identify this build.'
+          ) | Set-Content release-notes.md -Encoding utf8
+          gh release create $env:RELEASE_TAG @assets --draft --target $env:RELEASE_COMMIT --title "MiHome-Windows $env:RELEASE_TAG" --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create the draft release.' }

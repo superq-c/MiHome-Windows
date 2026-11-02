@@ -79,3 +79,4 @@ htmlcov/
 
 # 本地编译的视频组件；认证会话仅使用系统临时目录，不在此处保存。
 runtime/camera/
+release-artifacts/

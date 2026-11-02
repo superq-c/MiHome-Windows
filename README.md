@@ -63,6 +63,25 @@ python -m venv .venv
 源码模式下运行日志会同时写入项目根的 `debug.log`（结构化）与 `app.log`
 （控制台原始输出 + 崩溃堆栈），排查问题时两个都值得看。
 
+## 在 GitHub 手动打包
+
+打开仓库的 [Actions → 手动打包 Windows](https://github.com/superq-c/MiHome-Windows/actions/workflows/build-windows.yml)，
+点击 **Run workflow**，选择分支后运行。若 Fork 的 Actions 尚未启用，先按页面提示启用。
+流程只接受手动触发，普通提交和推送不会自动打包。
+
+- 默认只打包：完成后在本次运行底部 **Artifacts** 下载 Windows x64 压缩包、SHA-256 校验文件和构建信息，保留 30 天。
+- 需要 Releases 时：勾选 `create_release`，填入未使用的新标签，例如 `v0.5.0-build.1`。
+  标签的基础版本必须与 `pyproject.toml` 和 `app/__init__.py` 一致；已有标签或 Release 不会被覆盖。
+  流程生成的是 **草稿**，到 Releases 检查后点击发布即可。
+
+打包会运行离线回归，构建固定版本的摄像头视频组件，再用 MSVC / Nuitka 编译完整应用。
+发布包包含视频组件、Qt 多媒体插件及许可证，并检查登录数据和个人配置是否被误带入。
+已知不稳定的 Qt 离屏 `theme_test` 不作为此流程的打包门禁。
+解压 ZIP 的全部内容后运行 `MiHome-Windows.exe`，不要只复制单个 EXE。
+
+也可使用已登录的 GitHub CLI：`gh workflow run build-windows.yml --ref main`。
+本地检查发布压缩步骤可运行 `./tests/package_release_test.ps1`；该测试仅创建假文件，不编译或启动设备控制程序。
+
 ## 摄像头实时预览（首版）
 
 打开摄像头设备详情，第一张 **实时预览** 卡片显示视频入口和设备状态。

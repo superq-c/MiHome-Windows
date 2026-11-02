@@ -310,9 +310,17 @@ $NuitkaArgs = @(
     "--copyright=Copyright (C) 2026 MiHome-Windows contributors"
 )
 
-# 视频组件是可选的独立进程；只打包已构建的二进制与许可证，不带会话配置。
-if (Test-Path (Join-Path $Root 'runtime\camera\go2rtc.exe')) {
-    $NuitkaArgs += '--include-data-dir=runtime/camera=runtime/camera'
+# 视频组件是独立 Go 可执行文件，不能当作 Nuitka data-dir（.exe 会被忽略）。
+# 编译成功后按固定清单复制，避免把会话文件或临时探针带入分发目录。
+$CameraSource = Join-Path $Root 'runtime/camera'
+$CameraFiles = @('go2rtc.exe', 'LICENSE.go2rtc', 'LICENSE.control', 'SOURCE.md')
+$HasCameraRuntime = Test-Path -LiteralPath (Join-Path $CameraSource 'go2rtc.exe')
+if ($HasCameraRuntime) {
+    foreach ($Name in $CameraFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $CameraSource $Name) -PathType Leaf)) {
+            throw "Camera runtime component missing: $Name"
+        }
+    }
 } else {
     Write-Host 'Camera runtime not built; live preview will be unavailable. Run tools\build_camera_bridge.ps1 to include it.' -ForegroundColor Yellow
 }
@@ -344,6 +352,13 @@ if (Test-Path "dist\run.dist") {
 
 $Exe = "dist\MiHome-Windows.exe"
 if (Test-Path $Exe) {
+    if ($HasCameraRuntime) {
+        $CameraTarget = Join-Path $Root 'dist/runtime/camera'
+        New-Item -ItemType Directory -Force -Path $CameraTarget | Out-Null
+        foreach ($Name in $CameraFiles) {
+            Copy-Item -LiteralPath (Join-Path $CameraSource $Name) -Destination (Join-Path $CameraTarget $Name)
+        }
+    }
     # ---- 隐私自检：产物里绝不能出现用户数据 ----
     # 本程序把配置/缓存写在数据目录（源码模式=项目根，构建版=%LOCALAPPDATA%），
     # 其中 devices_cache.json、board.json 等含设备清单；auth.json 是登录凭据。
